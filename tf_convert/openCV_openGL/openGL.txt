@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+
+import sys
+import tensorflow as tf
+import numpy as np
+import argparse
+import pyzed.sl as sl
+import OpenGL.GL as gl
+import OpenGL.GLUT as glut
+from threading import Lock, Thread
+from time import sleep
+
+lock = Lock()
+run_signal = False
+exit_signal = False
+
+def load_tf_model():
+    model = tf.saved_model.load("path/to/tensorflow/model/directory")
+    return model
+
+def xywh2abcd(bbox, im_shape):
+    output = tf.zeros((4, 2), dtype=tf.float32)
+    x_min = bbox[1] * im_shape[1]
+    x_max = bbox[3] * im_shape[1]
+    y_min = bbox[0] * im_shape[0]
+    y_max = bbox[2] * im_shape[0]
+    output = tf.tensor_scatter_nd_update(
+        output,
+        indices=[[0, 0], [0, 1], [1, 0], [1, 1], [2, 0], [2, 1], [3, 0], [3, 1]],
+        updates=[x_min, y_min, x_max, y_min, x_max, y_max, x_min, y_max])
+    return output
+
+def detections_to_custom_box(detections, im0):
+    output = []
+    im_shape = im0.shape
+    for detection in detections['detection_boxes']:
+        bbox_converted = xywh2abcd(detection, im_shape)
+        output.append(bbox_converted.numpy())
+    return output
+
+def draw_boxes_with_opengl(boxes):
+    gl.glClear(gl.GL_COLOR_BUFFER_BIT | gl.GL_DEPTH_BUFFER_BIT)
+    gl.glMatrixMode(gl.GL_MODELVIEW)
+    gl.glLoadIdentity()
+    for box in boxes:
+        pt1 = (int(box[0][0]), int(box[0][1]))
+        pt2 = (int(box[2][0]), int(box[2][1]))
+        gl.glBegin(gl.GL_LINE_LOOP)
+        gl.glColor3f(0, 1, 0)
+        gl.glVertex2f(pt1[0], pt1[1])
+        gl.glVertex2f(pt2[0], pt1[1])
+        gl.glVertex2f(pt2[0], pt2[1])
+        gl.glVertex2f(pt1[0], pt2[1])
+        gl.glEnd()
+    glut.glutSwapBuffers()
+
+def run_inference(model, frame):
+    input_tensor = tf.convert_to_tensor(frame)
+    input_tensor = input_tensor[tf.newaxis, ...]
+    detections = model(input_tensor)
+    processed_boxes = detections_to_custom_box(detections, frame)
+    return processed_boxes, frame
+
+def capture_frame(zed):
+    runtime_parameters = sl.RuntimeParameters()
+    image = sl.Mat()
+    if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
+        zed.retrieve_image(image, sl.VIEW.LEFT)
+        frame = image.get_data()
+        return frame
+    return None
+
+def initialize_opengl(width, height):
+    glut.glutInit()
+    glut.glutInitDisplayMode(glut.GLUT_RGB | glut.GLUT_DOUBLE | glut.GLUT_DEPTH)
+    glut.glutInitWindowSize(width, height)
+    glut.glutCreateWindow(b"OpenGL Object Detection")
+    gl.glClearColor(0.0, 0.0, 0.0, 0.0)
+    gl.glMatrixMode(gl.GL_PROJECTION)
+    gl.glLoadIdentity()
+    gl.glOrtho(0, width, 0, height, -1, 1)
+    glut.glutDisplayFunc(display_callback)
+    glut.glutIdleFunc(idle_callback)
+
+def display_callback():
+    global boxes
+    draw_boxes_with_opengl(boxes)
+
+def idle_callback():
+    glut.glutPostRedisplay()
+
+def main():
+    global boxes
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, default='ssd_mobilenet_v2_fpnlite_320x320', help='Path to TensorFlow model directory')
+    args = parser.parse_args()
+    model = load_tf_model()
+    zed = sl.Camera()
+    init_params = sl.InitParameters()
+    init_params.camera_resolution = sl.RESOLUTION.HD720
+    init_params.coordinate_units = sl.UNIT.METER
+    if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
+        print("Could not open the ZED camera")
+        exit(1)
+    frame = capture_frame(zed)
+    if frame is not None:
+        initialize_opengl(frame.shape[1], frame.shape[0])
+    while True:
+        frame = capture_frame(zed)
+        if frame is not None:
+            boxes, processed_frame = run_inference(model, frame)
+        glut.glutMainLoopEvent()
+#    zed.close()
+
+if __name__ == '__main__':
+    main()

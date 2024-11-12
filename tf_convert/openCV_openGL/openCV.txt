@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+
+import sys
+import tensorflow as tf
+import numpy as np
+import argparse
+import cv2  # Ensure OpenCV is used
+import pyzed.sl as sl
+from threading import Lock, Thread
+from time import sleep
+import random
+
+import ogl_viewer.viewer as gl
+import cv_viewer.tracking_viewer as cv_viewer
+
+lock = Lock()
+run_signal = False
+exit_signal = False
+
+def load_tf_model():
+    model = tf.saved_model.load("path/to/tensorflow/model/directory")
+    return model
+
+def xywh2abcd(bbox, im_shape):
+    output = tf.zeros((4, 2), dtype=tf.float32)
+
+    x_min = bbox[1] * im_shape[1]
+    x_max = bbox[3] * im_shape[1]
+    y_min = bbox[0] * im_shape[0]
+    y_max = bbox[2] * im_shape[0]
+
+    output = tf.tensor_scatter_nd_update(
+        output,
+        indices=[[0, 0], [0, 1], [1, 0], [1, 1], [2, 0], [2, 1], [3, 0], [3, 1]],
+        updates=[x_min, y_min, x_max, y_min, x_max, y_max, x_min, y_max])
+    return output
+
+def detections_to_custom_box(detections, im0):
+    output = []
+    im_shape = im0.shape
+    for detection in detections['detection_boxes']:
+        bbox_converted = xywh2abcd(detection, im_shape)
+        output.append(bbox_converted.numpy())
+    return output
+
+def draw_boxes_on_frame(frame, boxes):
+    for box in boxes:
+        pt1 = (int(box[0][0]), int(box[0][1]))
+        pt2 = (int(box[2][0]), int(box[2][1]))
+        cv2.rectangle(frame, pt1, pt2, (0, 255, 0), 2)
+    return frame
+
+def preprocess_frame(frame):
+    scaled_frame = cv2.resize(frame, (640, 640))
+    
+    crop_size = 480 
+    x = random.randint(0, scaled_frame.shape[1] - crop_size)
+    y = random.randint(0, scaled_frame.shape[0] - crop_size)
+    cropped_frame = scaled_frame[y:y+crop_size, x:x+crop_size]
+
+    final_frame = cv2.resize(cropped_frame, (640, 640))
+
+    return final_frame
+
+def run_inference(model, frame):
+    preprocessed_frame = preprocess_frame(frame)
+    input_tensor = tf.convert_to_tensor(preprocessed_frame)
+    input_tensor = input_tensor[tf.newaxis, ...]
+    
+    detections = model(input_tensor)
+    
+    processed_boxes = detections_to_custom_box(detections, preprocessed_frame)
+    return processed_boxes, preprocessed_frame
+
+#ZED camera
+def capture_frame(zed):
+    runtime_parameters = sl.RuntimeParameters()
+    image = sl.Mat()
+    if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
+        zed.retrieve_image(image, sl.VIEW.LEFT)
+        frame = image.get_data()
+        return frame
+    return None
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, default='ssd_mobilenet_v2_fpnlite_320x320', help='Path to TensorFlow model directory')
+#    args = parser.parse_args()
+
+    model = load_tf_model()
+
+    #ZED camera
+    zed = sl.Camera()
+    init_params = sl.InitParameters()
+    init_params.camera_resolution = sl.RESOLUTION.HD720
+    init_params.coordinate_units = sl.UNIT.METER
+    if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
+        print("Could not open the ZED camera")
+        exit(1)
+
+    while True:
+        frame = capture_frame(zed)
+        if frame is not None:
+            boxes, processed_frame = run_inference(model, frame)
+            frame_with_boxes = draw_boxes_on_frame(processed_frame, boxes)
+            cv2.imshow("Detections", frame_with_boxes)
+
+            if cv2.waitKey(0):
+                break
+
+    zed.close()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()

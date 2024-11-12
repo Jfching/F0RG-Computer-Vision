@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+
+import sys
+import numpy as np
+import argparse
+import cv2
+import pyzed.sl as sl
+import tflite_runtime.interpreter as tflite
+
+from time import sleep
+from threading import Lock, Thread
+
+lock = Lock()
+run_signal = False
+exit_signal = False
+
+def load_tpu_model(model_path):
+    interpreter = tflite.Interpreter(model_path=model_path, experimental_delegates=[tflite.load_delegate('libedgetpu.so.1')])
+    interpreter.allocate_tensors()
+    return interpreter
+
+def xywh2abcd(xywh, im_shape):
+    output = np.zeros((4, 2))
+    x_min = (xywh[0] - 0.5 * xywh[2]) * im_shape[1]
+    x_max = (xywh[0] + 0.5 * xywh[2]) * im_shape[1]
+    y_min = (xywh[1] - 0.5 * xywh[3]) * im_shape[0]
+    y_max = (xywh[1] + 0.5 * xywh[3]) * im_shape[0]
+
+    output[0] = [x_min, y_min]
+    output[1] = [x_max, y_min]
+    output[2] = [x_max, y_max]
+    output[3] = [x_min, y_max]
+    return output
+
+def detections_to_custom_box(detections, im0_shape):
+    output = []
+    im_shape = im0_shape
+    for detection in detections:
+        bbox_converted = xywh2abcd(detection, im_shape)
+        output.append(bbox_converted)
+    return output
+
+def preprocess_frame(frame, input_size=(300, 300)):
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    resized_frame = cv2.resize(frame_rgb, input_size)
+    input_data = np.expand_dims(resized_frame, axis=0).astype(np.uint8)
+    return input_data
+
+def run_inference(interpreter, frame):
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+    input_data = preprocess_frame(frame, (300, 300))
+    
+    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.invoke()
+
+    boxes = interpreter.get_tensor(output_details[0]['index'])[0]
+    class_ids = interpreter.get_tensor(output_details[1]['index'])[0]
+    scores = interpreter.get_tensor(output_details[2]['index'])[0]
+
+    return boxes, class_ids, scores
+
+def draw_boxes_on_frame(frame, boxes, class_ids, scores, threshold=0.5):
+    height, width, _ = frame.shape
+    for i in range(len(boxes)):
+        if scores[i] >= threshold:
+            y_min, x_min, y_max, x_max = boxes[i]
+            pt1 = (int(x_min * width), int(y_min * height))
+            pt2 = (int(x_max * width), int(y_max * height))
+            cv2.rectangle(frame, pt1, pt2, (0, 255, 0), 2)
+            label = f"ID: {int(class_ids[i])}, Score: {scores[i]:.2f}"
+            cv2.putText(frame, label, (pt1[0], pt1[1] - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+    return frame
+
+#ZED camera
+def capture_frame(zed):
+    runtime_parameters = sl.RuntimeParameters()
+    image = sl.Mat()
+    if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
+        zed.retrieve_image(image, sl.VIEW.LEFT)
+        frame = image.get_data()
+        return frame
+    return None
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, required=True, help='Path to TensorFlow Lite YOLO model for Edge TPU')
+    args = parser.parse_args()
+
+    interpreter = load_tpu_model(args.model)
+
+    zed = sl.Camera()
+    init_params = sl.InitParameters()
+    init_params.camera_resolution = sl.RESOLUTION.HD720
+    init_params.coordinate_units = sl.UNIT.METER
+    if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
+        print("Could not open the ZED camera")
+        exit(1)
+
+    while True:
+        frame = capture_frame(zed)
+        if frame is not None:
+            boxes, class_ids, scores = run_inference(interpreter, frame)
+            frame_with_boxes = draw_boxes_on_frame(frame, boxes, class_ids, scores)
+            cv2.imshow("TPU Detections", frame_with_boxes)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
+
+    zed.close()
+    cv2.destroyAllWindows()
+
+if __name__ == '__main__':
+    main()

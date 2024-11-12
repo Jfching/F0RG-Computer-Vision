@@ -1,0 +1,87 @@
+#!/usr/bin/env python3
+
+import sys
+import tensorflow as tf
+import numpy as np
+import argparse
+import cv2
+import pyzed.sl as sl
+from ultralytics import YOLO
+
+from threading import Lock, Thread
+from time import sleep
+import ogl_viewer.viewer as gl
+import cv_viewer.tracking_viewer as cv_viewer
+
+lock = Lock()
+run_signal = False
+exit_signal = False
+
+def xywh2abcd(xywh, im_shape):
+    output = tf.zeros((4, 2), dtype=tf.float32)
+
+    x_min = (xywh[0] - 0.5 * xywh[2])
+    x_max = (xywh[0] + 0.5 * xywh[2])
+    y_min = (xywh[1] - 0.5 * xywh[3])
+    y_max = (xywh[1] + 0.5 * xywh[3])
+
+    output = tf.tensor_scatter_nd_update(
+        output,
+        indices=[[0, 0], [0, 1], [1, 0], [1, 1], [2, 0], [2, 1], [3, 0], [3, 1]],
+        updates=[x_min, y_min, x_max, y_min, x_max, y_max, x_min, y_max])
+    return output
+
+def detections_to_custom_box(detections, im0):
+    output = []
+    for det in detections:
+        bbox = det.xywh[0]
+        bbox_tf = tf.convert_to_tensor(bbox, dtype=tf.float32)
+        bbox_converted = xywh2abcd(bbox_tf, im0.shape)
+        output.append(bbox_converted.numpy())
+    return output
+
+def initialize_yolo_model(model_path):
+    model = YOLO(model_path)
+    return model
+
+def run_inference(model, frame):
+    results = model(frame)
+    detections = results[0].boxes 
+    processed_boxes = detections_to_custom_box(detections, frame)
+    return processed_boxes
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, default='yolov8n.pt', help='Path to YOLO model')
+    args = parser.parse_args()
+
+    model = initialize_yolo_model(args.model)
+
+    #ZED camera
+    zed = sl.Camera()
+    init_params = sl.InitParameters()
+    init_params.camera_resolution = sl.RESOLUTION.HD720
+    init_params.coordinate_units = sl.UNIT.METER
+    if zed.open(init_params) != sl.ERROR_CODE.SUCCESS:
+        print("Could not open the ZED camera")
+        exit(1)
+
+    while True:
+        frame = capture_frame(zed)  #Capture a frame
+        if frame is not None:
+            boxes = run_inference(model, frame)
+            print("Detected Boxes:", boxes)
+
+#    zed.close()
+
+def capture_frame(zed):
+    runtime_parameters = sl.RuntimeParameters()
+    image = sl.Mat()
+    if zed.grab(runtime_parameters) == sl.ERROR_CODE.SUCCESS:
+        zed.retrieve_image(image, sl.VIEW.LEFT)
+        frame = image.get_data()
+        return frame
+    return None
+
+if __name__ == '__main__':
+    main()
